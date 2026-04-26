@@ -388,10 +388,43 @@ def set_status(msg, pct=None):
 
 
 def normalize_url(url):
-    url = url.replace("\\?", "?").replace("\\&", "&").replace("\\", "")
-    url = re.sub(r"&preload\b", "&play", url)
-    url = re.sub(r"\?preload\b", "?play", url)
-    return url.strip()
+  url = url.replace("\\?", "?").replace("\\&", "&").replace("\\", "")
+  url = re.sub(r"&preload\b", "&play", url)
+  url = re.sub(r"\?preload\b", "?play", url)
+  url = url.strip()
+
+  # If running inside Docker, container-local "localhost:8090" won't reach the host.
+  # Rewrite such URLs to host.docker.internal:8090 so ffmpeg inside the container
+  # can access services running on the macOS host.
+  def running_in_docker():
+    try:
+      if os.path.exists('/.dockerenv'):
+        return True
+      with open('/proc/1/cgroup', 'rt') as f:
+        data = f.read()
+        if 'docker' in data or 'kubepods' in data or 'containerd' in data:
+          return True
+    except Exception:
+      pass
+    return False
+
+  try:
+    parsed = urllib.parse.urlparse(url)
+    if running_in_docker() and parsed.scheme in ('http', 'https') and parsed.hostname in ('localhost', '127.0.0.1'):
+      port = parsed.port or (80 if parsed.scheme == 'http' else 443)
+      if port == 8090:
+        new_netloc = 'host.docker.internal:8090'
+        new_parsed = parsed._replace(netloc=new_netloc)
+        new_url = urllib.parse.urlunparse(new_parsed)
+        try:
+          add_log(f"↔ Rewriting URL for Docker: {url} → {new_url}", "warn")
+        except Exception:
+          pass
+        return new_url
+  except Exception:
+    pass
+
+  return url
 
 
 def parse_srt(content):
