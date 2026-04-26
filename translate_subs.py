@@ -12,7 +12,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 OUTPUT_DIR = os.path.expanduser("~/Downloads/translated_subs")
 GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
-BATCH_SIZE = 8
+BATCH_SIZE = 15
 SETTINGS_PATH = os.path.expanduser("~/.subtranslate.json")
 PORT = 7755
 
@@ -573,7 +573,7 @@ def run_translation(video_url, api_key, track, force=False, lang='ru'):
         time.sleep(2)
       done = min(i + BATCH_SIZE, total)
       set_status(f"Translating: {done}/{total}", 25 + int(done / total * 70))
-      time.sleep(5)
+      time.sleep(3)
 
     with open(translated_srt, "w", encoding="utf-8") as f:
       for i, (idx, timing, _) in enumerate(blocks):
