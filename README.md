@@ -89,7 +89,8 @@ Files are written as `<basename>.<lang>.srt`, e.g. `movie.ru.srt` or `movie.uk.s
 ## Troubleshooting
 - If subtitles extraction fails, ensure `ffmpeg` can access the stream and the correct subtitle track is selected.
 - For Gemini rate limits, the script does basic retry/backoff and will log rate-limit warnings in the UI.
-
+ - For Gemini rate limits, the script does basic retry/backoff and will log rate-limit warnings in the UI. See: https://aistudio.google.com/rate-limit
+ - To create or manage Gemini API keys visit: https://aistudio.google.com/app/api-keys
 ## Security
 - Keep your `GEMINI_API_KEY` secret. Prefer passing it via environment variables or a host-mounted `~/.subtranslate.json` instead of embedding in images.
 
