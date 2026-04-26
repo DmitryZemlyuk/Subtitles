@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  subtranslate:
+    build: .
+    image: subtranslate:latest
+    ports:
+      - "7755:7755"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - ${OUTPUT_DIR:-${HOME}/Downloads/translated_subs}:/root/Downloads/translated_subs
+      - ${HOME}/.subtranslate.json:/root/.subtranslate.json:rw
+    restart: unless-stopped
