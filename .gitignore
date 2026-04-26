@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+.env.local
+*.sqlite3
+.DS_Store
+assets/screenshot.png
