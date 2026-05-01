@@ -458,7 +458,7 @@ def gemini_batch(texts, api_key, target_lang='ru'):
 
   body = json.dumps({
     "contents": [{"parts": [{"text": prompt}]}],
-    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048}
+    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192}
   }).encode()
 
   url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -482,9 +482,9 @@ def gemini_batch(texts, api_key, target_lang='ru'):
 
   reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-  # Parse XML response using chosen tag
+  # Parse XML response using chosen tag (tolerant to spaces/newlines around tags)
   result = {}
-  regex = re.compile(rf'<s id="(\d+)"><{tag}>(.*?)</{tag}></s>', re.DOTALL)
+  regex = re.compile(rf'<s\s+id=["\']?(\d+)["\']?>\s*<{tag}>(.*?)</{tag}>\s*</s>', re.DOTALL)
   for m in regex.finditer(reply):
     result[int(m.group(1))] = m.group(2).strip()
 
@@ -494,6 +494,12 @@ def gemini_batch(texts, api_key, target_lang='ru'):
       m = re.match(r"\[(\d+)\]\s*(.*)", line.strip())
       if m:
         result[int(m.group(1))] = m.group(2).strip()
+
+  # Log missing translations so we can see what went wrong
+  missing = [i for i in range(len(texts)) if i not in result]
+  if missing:
+    add_log(f"  ⚠ {len(missing)}/{len(texts)} lines not parsed in batch (ids: {missing[:5]}{'...' if len(missing)>5 else ''})", "warn")
+    add_log(f"  ⚠ Raw reply preview: {reply[:200].strip()}", "warn")
 
   return [result.get(i, texts[i]) for i in range(len(texts))]
 
