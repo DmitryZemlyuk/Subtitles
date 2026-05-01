@@ -465,20 +465,25 @@ def gemini_batch(texts, api_key, target_lang='ru'):
        f"{GEMINI_MODEL}:generateContent?key={api_key}")
   req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
 
-  for attempt in range(3):
+  data = None
+  for attempt in range(4):
     try:
       with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.loads(resp.read())
       break
     except Exception as e:
-      if "429" in str(e) or "quota" in str(e).lower():
-        wait = (attempt + 1) * 15
-        add_log(f"  ⏳ Rate limit, waiting {wait}s...", "warn")
-        time.sleep(wait)
-        if attempt == 2:
-          return texts
+      err_str = str(e)
+      if "429" in err_str or "quota" in err_str.lower():
+        wait = (attempt + 1) * 20
+        add_log(f"  ⏳ Rate limit (attempt {attempt+1}/4), waiting {wait}s...", "warn")
       else:
-        return texts
+        wait = (attempt + 1) * 5
+        add_log(f"  ⚠ API error (attempt {attempt+1}/4): {err_str[:120]}, retry in {wait}s...", "warn")
+      time.sleep(wait)
+
+  if data is None:
+    add_log(f"  ❌ All retries failed, using original for this batch", "err")
+    return texts
 
   reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
