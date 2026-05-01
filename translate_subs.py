@@ -12,7 +12,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 OUTPUT_DIR = os.path.expanduser("~/Downloads/translated_subs")
 GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
-BATCH_SIZE = 10
+BATCH_SIZE = 5
 SETTINGS_PATH = os.path.expanduser("~/.subtranslate.json")
 PORT = 7755
 
