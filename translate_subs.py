@@ -504,10 +504,8 @@ def gemini_batch(texts, api_key, target_lang='ru'):
 
     reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-    # ✅ ВИПРАВЛЕННЯ: толерантний парсинг — матчить повні <s> І усічені (без закриваючого </s>)
     result = {}
-    
-    # Спочатку повні теги
+
     regex_full = re.compile(
         rf'<s\s+id=["\']?(\d+)["\']?>\s*<{tag}>(.*?)</{tag}>\s*</s>',
         re.DOTALL
@@ -515,8 +513,6 @@ def gemini_batch(texts, api_key, target_lang='ru'):
     for m in regex_full.finditer(reply):
         result[int(m.group(1))] = m.group(2).strip()
 
-    # Потім усічені — є <s id="N"><uk>TEXT але немає </uk></s>
-    # Матчимо тільки ті id яких ще немає в result
     regex_partial = re.compile(
         rf'<s\s+id=["\']?(\d+)["\']?>\s*<{tag}>(.*?)(?:</{tag}>|$)',
         re.DOTALL
@@ -525,12 +521,10 @@ def gemini_batch(texts, api_key, target_lang='ru'):
         idx = int(m.group(1))
         if idx not in result:
             text = m.group(2).strip()
-            # Прибираємо хвостовий сміття типу </s> або незакриті теги
             text = re.sub(r'<[^>]*$', '', text).strip()
             if text:
                 result[idx] = text
 
-    # Fallback: числовий [N] формат
     if not result:
         for line in reply.split("\n"):
             m = re.match(r"\[(\d+)\]\s*(.*)", line.strip())
