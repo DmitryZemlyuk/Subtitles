@@ -15,6 +15,18 @@ GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
 BATCH_SIZE = 5
 SETTINGS_PATH = os.path.expanduser("~/.subtranslate.json")
 PORT = 7755
+API_RPM_LIMIT = 15
+MIN_API_INTERVAL = 60.0 / API_RPM_LIMIT
+
+# Timestamp of last API call (seconds since epoch)
+_last_api_call = 0.0
+# Dynamic batching / token estimation for TPM
+MAX_INPUT_TOKENS_PER_REQUEST = 3000
+MAX_BATCH_SIZE_LIMIT = 50
+
+def estimate_tokens(text: str) -> int:
+  # Rough heuristic: ~4 characters per token for English-like text
+  return max(1, int(len(text) / 4))
 
 # Global log and status
 _log_lines = []
@@ -440,6 +452,97 @@ def parse_srt(content):
 
 
 def gemini_batch(texts, api_key, target_lang='ru'):
+    parts = []
+    for i, t in enumerate(texts):
+        parts.append(f"<s id=\"{i}\"><en>{t}</en></s>")
+
+    lang_name = 'Russian' if target_lang == 'ru' else 'Ukrainian'
+    tag = target_lang
+
+    prompt = (
+        f"Translate TV show subtitles from English to {lang_name}. "
+        f"For each <s> tag return <s id=\"N\"><{tag}>TRANSLATION</{tag}></s>. "
+        "Translate ALL content fully, do not shorten. "
+        "Respond only with XML, without explanations.\n\n" + "\n".join(parts)
+    )
+
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192}
+    }).encode()
+
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={api_key}")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+
+    data = None
+    global _last_api_call
+    for attempt in range(4):
+        try:
+            elapsed = time.time() - _last_api_call
+            if elapsed < MIN_API_INTERVAL:
+                to_wait = MIN_API_INTERVAL - elapsed
+                add_log(f"  ⏳ Throttling: sleeping {to_wait:.1f}s to respect {API_RPM_LIMIT} RPM", "warn")
+                time.sleep(to_wait)
+            _last_api_call = time.time()
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+            break
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "quota" in err_str.lower():
+                wait = (attempt + 1) * 20
+                add_log(f"  ⏳ Rate limit (attempt {attempt+1}/4), waiting {wait}s...", "warn")
+            else:
+                wait = (attempt + 1) * 5
+                add_log(f"  ⚠ API error (attempt {attempt+1}/4): {err_str[:120]}, retry in {wait}s...", "warn")
+            time.sleep(wait)
+
+    if data is None:
+        add_log(f"  ❌ All retries failed, using original for this batch", "err")
+        return texts
+
+    reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    # ✅ ВИПРАВЛЕННЯ: толерантний парсинг — матчить повні <s> І усічені (без закриваючого </s>)
+    result = {}
+    
+    # Спочатку повні теги
+    regex_full = re.compile(
+        rf'<s\s+id=["\']?(\d+)["\']?>\s*<{tag}>(.*?)</{tag}>\s*</s>',
+        re.DOTALL
+    )
+    for m in regex_full.finditer(reply):
+        result[int(m.group(1))] = m.group(2).strip()
+
+    # Потім усічені — є <s id="N"><uk>TEXT але немає </uk></s>
+    # Матчимо тільки ті id яких ще немає в result
+    regex_partial = re.compile(
+        rf'<s\s+id=["\']?(\d+)["\']?>\s*<{tag}>(.*?)(?:</{tag}>|$)',
+        re.DOTALL
+    )
+    for m in regex_partial.finditer(reply):
+        idx = int(m.group(1))
+        if idx not in result:
+            text = m.group(2).strip()
+            # Прибираємо хвостовий сміття типу </s> або незакриті теги
+            text = re.sub(r'<[^>]*$', '', text).strip()
+            if text:
+                result[idx] = text
+
+    # Fallback: числовий [N] формат
+    if not result:
+        for line in reply.split("\n"):
+            m = re.match(r"\[(\d+)\]\s*(.*)", line.strip())
+            if m:
+                result[int(m.group(1))] = m.group(2).strip()
+
+    missing = [i for i in range(len(texts)) if i not in result]
+    if missing:
+        add_log(f"  ⚠ {len(missing)}/{len(texts)} lines not parsed (ids: {missing[:5]}{'...' if len(missing)>5 else ''})", "warn")
+        add_log(f"  ⚠ Raw reply preview: {reply[:200].strip()}", "warn")
+
+    return [result.get(i, texts[i]) for i in range(len(texts))]
   """Translate a batch of lines in one structured request to the given language.
   target_lang: 'ru' or 'uk'"""
   parts = []
@@ -466,8 +569,16 @@ def gemini_batch(texts, api_key, target_lang='ru'):
   req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
 
   data = None
+  global _last_api_call
   for attempt in range(4):
     try:
+      # Enforce minimum interval between API calls to respect RPM limit
+      elapsed = time.time() - _last_api_call
+      if elapsed < MIN_API_INTERVAL:
+        to_wait = MIN_API_INTERVAL - elapsed
+        add_log(f"  ⏳ Throttling: sleeping {to_wait:.1f}s to respect {API_RPM_LIMIT} RPM", "warn")
+        time.sleep(to_wait)
+      _last_api_call = time.time()
       with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.loads(resp.read())
       break
@@ -507,10 +618,6 @@ def gemini_batch(texts, api_key, target_lang='ru'):
     add_log(f"  ⚠ Raw reply preview: {reply[:200].strip()}", "warn")
 
   return [result.get(i, texts[i]) for i in range(len(texts))]
-
-
-
-
 
 def run_translation(video_url, api_key, track, force=False, lang='ru'):
   global _running, _progress
@@ -571,20 +678,41 @@ def run_translation(video_url, api_key, track, force=False, lang='ru'):
     add_log(f"  Blocks: {total}", "")
     translated_texts = []
 
-    for i in range(0, total, BATCH_SIZE):
+    i = 0
+    while i < total:
       if not _running:
         return
-      batch = blocks[i:i + BATCH_SIZE]
+      # Build a batch that fits within estimated input token budget
+      batch = []
+      batch_input_tokens = 0
+      j = i
+      while j < total and len(batch) < MAX_BATCH_SIZE_LIMIT:
+        t = blocks[j][2]
+        tok = estimate_tokens(t)
+        if batch_input_tokens + tok > MAX_INPUT_TOKENS_PER_REQUEST:
+          break
+        batch.append(blocks[j])
+        batch_input_tokens += tok
+        j += 1
+
+      # If nothing was added (single line exceeds limit), force at least one
+      if not batch:
+        batch = [blocks[i]]
+        j = i + 1
+
       texts = [b[2] for b in batch]
       try:
         translated_texts.extend(gemini_batch(texts, api_key, lang))
       except Exception as e:
-        add_log(f"  ⚠ Batch {i}: {e}", "warn")
+        add_log(f"  ⚠ Batch at {i}: {e}", "warn")
         translated_texts.extend(texts)
         time.sleep(2)
-      done = min(i + BATCH_SIZE, total)
+
+      done = min(j, total)
       set_status(f"Translating: {done}/{total}", 25 + int(done / total * 70))
-      time.sleep(3)
+      # Small pause to allow UI updates; API throttling enforced in gemini_batch
+      time.sleep(0.05)
+      i = j
 
     with open(translated_srt, "w", encoding="utf-8") as f:
       for i, (idx, timing, _) in enumerate(blocks):
