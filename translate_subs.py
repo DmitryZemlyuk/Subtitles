@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-SubTranslate — web UI for translating subtitles (TorrServer).
+SubTranslate — web UI for translating subtitles (TorrServer + Local SRT).
 Usage: python3 translate_subs.py
 Opens browser at http://localhost:7755
-This utility only translates subtitles; it does not open any player.
 """
 
 import os, re, sys, json, time, threading, subprocess, shutil
@@ -18,17 +17,13 @@ PORT = 7755
 API_RPM_LIMIT = 15
 MIN_API_INTERVAL = 60.0 / API_RPM_LIMIT
 
-# Timestamp of last API call (seconds since epoch)
 _last_api_call = 0.0
-# Dynamic batching / token estimation for TPM
 MAX_INPUT_TOKENS_PER_REQUEST = 3000
 MAX_BATCH_SIZE_LIMIT = 50
 
 def estimate_tokens(text: str) -> int:
-  # Rough heuristic: ~4 characters per token for English-like text
-  return max(1, int(len(text) / 4))
+    return max(1, int(len(text) / 4))
 
-# Global log and status
 _log_lines = []
 _progress = 0
 _status = "Ready"
@@ -118,7 +113,7 @@ HTML = r"""<!DOCTYPE html>
     color: var(--text2);
     margin-bottom: 6px;
   }
-  input {
+  input[type=text], input[type=password] {
     width: 100%;
     background: var(--surface2);
     border: 1px solid var(--border);
@@ -130,9 +125,47 @@ HTML = r"""<!DOCTYPE html>
     outline: none;
     transition: border-color 0.2s, box-shadow 0.2s;
   }
-  input:focus {
+  input[type=text]:focus, input[type=password]:focus {
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+  input[type=file] {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text2);
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    padding: 8px 14px;
+    outline: none;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  input[type=file]:hover { border-color: var(--accent); }
+  .mode-toggle {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .mode-btn {
+    flex: 1;
+    padding: 9px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--text2);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .mode-btn.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px var(--accent-glow);
   }
   .row { display: flex; gap: 12px; }
   .row .field { flex: 1; }
@@ -221,19 +254,46 @@ HTML = r"""<!DOCTYPE html>
   }
   .btn-stop:hover { border-color: var(--err); color: var(--err); }
   .btn-stop:disabled { opacity: 0.4; cursor: not-allowed; }
+  select {
+    width: 100%;
+    padding: 10px 14px;
+    height: 38px;
+    border-radius: 8px;
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
 </style>
 </head>
 <body>
 <div class="card">
   <div class="header">
     <div class="logo">Sub<span>Translate</span></div>
-    <div class="subtitle">torrserver → gemini</div>
+    <div class="subtitle">torrserver · local srt → gemini</div>
   </div>
   <div class="divider"></div>
 
-  <div class="field">
+  <!-- Mode toggle -->
+  <div class="mode-toggle">
+    <button class="mode-btn active" id="mode-btn-url" onclick="setMode('url')">🔗 TorrServer URL</button>
+    <button class="mode-btn" id="mode-btn-file" onclick="setMode('file')">📄 Local SRT file</button>
+  </div>
+
+  <!-- TorrServer URL field -->
+  <div id="field-url" class="field">
     <label>TorrServer video URL</label>
     <input type="text" id="url" placeholder="http://localhost:8090/stream/...">
+  </div>
+
+  <!-- Local SRT field -->
+  <div id="field-file" class="field" style="display:none;">
+    <label>Local SRT / VTT file</label>
+    <input type="file" id="srtfile" accept=".srt,.vtt">
   </div>
 
   <div class="row">
@@ -241,13 +301,13 @@ HTML = r"""<!DOCTYPE html>
       <label>Gemini API Key</label>
       <input type="password" id="apikey" placeholder="API key">
     </div>
-    <div class="field short">
+    <div class="field short" id="field-track">
       <label>Subtitle track</label>
       <input type="text" id="track" value="0" style="text-align:center">
     </div>
     <div class="field short">
       <label>Target language</label>
-      <select id="lang" style="width:100%;padding:10px 14px;height:38px;border-radius:8px;background:#1c1c26;color:#e2e0f0;border:1px solid #2a2a3a;font-family:'DM Mono',monospace;font-size:12px;">
+      <select id="lang">
         <option value="ru">Russian (ru)</option>
         <option value="uk">Ukrainian (uk)</option>
       </select>
@@ -271,30 +331,75 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Re-translate dialog -->
+<div id="dialog" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(4px);">
+  <div style="background:#13131a;border:1px solid #2a2a3a;border-radius:16px;padding:28px;max-width:420px;width:90%;">
+    <div style="font-size:15px;font-weight:600;margin-bottom:10px;">Translation already exists</div>
+    <div style="font-size:11px;color:#7a7890;font-family:'DM Mono',monospace;margin-bottom:6px;word-break:break-all;" id="dlg-path"></div>
+    <div style="font-size:13px;color:#9490a8;margin-bottom:24px;">Use existing file or re-translate?</div>
+    <div style="display:flex;gap:10px;">
+      <button id="btn-retranslate" class="btn-stop" style="flex:1;">↺ Re-translate</button>
+    </div>
+    <div style="text-align:center;margin-top:12px;">
+      <button onclick="hideDialog()" style="background:none;border:none;color:#7a7890;font-size:12px;cursor:pointer;">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let polling = null;
+let _mode = 'url';
 
 window.onload = () => {
   fetch('/settings').then(r=>r.json()).then(s => {
     if (s.api_key) document.getElementById('apikey').value = s.api_key;
-    if (s.track) document.getElementById('track').value = s.track;
-    if (s.lang) document.getElementById('lang').value = s.lang;
+    if (s.track)   document.getElementById('track').value = s.track;
+    if (s.lang)    document.getElementById('lang').value = s.lang;
   });
 };
 
+function setMode(m) {
+  _mode = m;
+  document.getElementById('field-url').style.display  = m === 'url'  ? '' : 'none';
+  document.getElementById('field-file').style.display = m === 'file' ? '' : 'none';
+  document.getElementById('field-track').style.display = m === 'url' ? '' : 'none';
+  document.getElementById('mode-btn-url').className  = 'mode-btn' + (m === 'url'  ? ' active' : '');
+  document.getElementById('mode-btn-file').className = 'mode-btn' + (m === 'file' ? ' active' : '');
+}
+
 async function start(force) {
-  const url = document.getElementById('url').value.trim();
-  const key = document.getElementById('apikey').value.trim();
-  const track = document.getElementById('track').value.trim() || '0';
+  const key  = document.getElementById('apikey').value.trim();
   const lang = document.getElementById('lang').value || 'ru';
-  if (!url) { alert('Paste video URL'); return; }
   if (!key) { alert('Enter Gemini API Key'); return; }
+
+  if (_mode === 'file') {
+    const fileInput = document.getElementById('srtfile');
+    if (!fileInput.files.length) { alert('Select an SRT file'); return; }
+    const file = fileInput.files[0];
+    const content = await file.text();
+
+    document.getElementById('btn-start').disabled = true;
+    document.getElementById('btn-stop').disabled = false;
+    document.getElementById('log').innerHTML = '';
+
+    const fd = new FormData();
+    fd.append('content', content);
+    fd.append('filename', file.name);
+    fd.append('key', key);
+    fd.append('lang', lang);
+    fetch('/start_file', { method: 'POST', body: fd });
+    polling = setInterval(poll, 600);
+    return;
+  }
+
+  // TorrServer URL mode
+  const url   = document.getElementById('url').value.trim();
+  const track = document.getElementById('track').value.trim() || '0';
+  if (!url) { alert('Paste video URL'); return; }
+
   if (force === undefined) {
     const check = await fetch('/check?url=' + encodeURIComponent(url) + '&lang=' + encodeURIComponent(lang)).then(r=>r.json());
-    if (check.exists) {
-      showDialog(check.path, url, key, track, lang);
-      return;
-    }
+    if (check.exists) { showDialog(check.path, url, key, track, lang); return; }
   }
 
   document.getElementById('btn-start').disabled = true;
@@ -307,7 +412,6 @@ async function start(force) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({url, key, track, force: !!force, lang})
   });
-
   polling = setInterval(poll, 600);
 }
 
@@ -345,27 +449,10 @@ function poll() {
   });
 }
 
-async function openExisting(url) {
-  hideDialog();
-}
-
 function escHtml(t) {
   return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 </script>
-<div id="dialog" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(4px);">
-  <div style="background:#13131a;border:1px solid #2a2a3a;border-radius:16px;padding:28px;max-width:420px;width:90%;">
-    <div style="font-size:15px;font-weight:600;margin-bottom:10px;">Translation already exists</div>
-    <div style="font-size:11px;color:#7a7890;font-family:'DM Mono',monospace;margin-bottom:6px;word-break:break-all;" id="dlg-path"></div>
-    <div style="font-size:13px;color:#9490a8;margin-bottom:24px;">Use existing file or re-translate?</div>
-    <div style="display:flex;gap:10px;">
-      <button id="btn-retranslate" class="btn-stop" style="flex:1;">↺ Re-translate</button>
-    </div>
-    <div style="text-align:center;margin-top:12px;">
-      <button onclick="hideDialog()" style="background:none;border:none;color:#7a7890;font-size:12px;cursor:pointer;">Cancel</button>
-    </div>
-  </div>
-</div>
 </body>
 </html>
 """
@@ -376,7 +463,7 @@ def load_settings():
         with open(SETTINGS_PATH) as f:
             return json.load(f)
     except Exception:
-      return {"api_key": os.environ.get("GEMINI_API_KEY", ""), "track": "0", "lang": "ru"}
+        return {"api_key": os.environ.get("GEMINI_API_KEY", ""), "track": "0", "lang": "ru"}
 
 
 def save_settings(api_key, track, lang="ru"):
@@ -400,43 +487,40 @@ def set_status(msg, pct=None):
 
 
 def normalize_url(url):
-  url = url.replace("\\?", "?").replace("\\&", "&").replace("\\", "")
-  url = re.sub(r"&preload\b", "&play", url)
-  url = re.sub(r"\?preload\b", "?play", url)
-  url = url.strip()
+    url = url.replace("\\?", "?").replace("\\&", "&").replace("\\", "")
+    url = re.sub(r"&preload\b", "&play", url)
+    url = re.sub(r"\?preload\b", "?play", url)
+    url = url.strip()
 
-  # If running inside Docker, container-local "localhost:8090" won't reach the host.
-  # Rewrite such URLs to host.docker.internal:8090 so ffmpeg inside the container
-  # can access services running on the macOS host.
-  def running_in_docker():
-    try:
-      if os.path.exists('/.dockerenv'):
-        return True
-      with open('/proc/1/cgroup', 'rt') as f:
-        data = f.read()
-        if 'docker' in data or 'kubepods' in data or 'containerd' in data:
-          return True
-    except Exception:
-      pass
-    return False
-
-  try:
-    parsed = urllib.parse.urlparse(url)
-    if running_in_docker() and parsed.scheme in ('http', 'https') and parsed.hostname in ('localhost', '127.0.0.1'):
-      port = parsed.port or (80 if parsed.scheme == 'http' else 443)
-      if port == 8090:
-        new_netloc = 'host.docker.internal:8090'
-        new_parsed = parsed._replace(netloc=new_netloc)
-        new_url = urllib.parse.urlunparse(new_parsed)
+    def running_in_docker():
         try:
-          add_log(f"↔ Rewriting URL for Docker: {url} → {new_url}", "warn")
+            if os.path.exists('/.dockerenv'):
+                return True
+            with open('/proc/1/cgroup', 'rt') as f:
+                data = f.read()
+                if 'docker' in data or 'kubepods' in data or 'containerd' in data:
+                    return True
         except Exception:
-          pass
-        return new_url
-  except Exception:
-    pass
+            pass
+        return False
 
-  return url
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if running_in_docker() and parsed.scheme in ('http', 'https') and parsed.hostname in ('localhost', '127.0.0.1'):
+            port = parsed.port or (80 if parsed.scheme == 'http' else 443)
+            if port == 8090:
+                new_netloc = 'host.docker.internal:8090'
+                new_parsed = parsed._replace(netloc=new_netloc)
+                new_url = urllib.parse.urlunparse(new_parsed)
+                try:
+                    add_log(f"↔ Rewriting URL for Docker: {url} → {new_url}", "warn")
+                except Exception:
+                    pass
+                return new_url
+    except Exception:
+        pass
+
+    return url
 
 
 def parse_srt(content):
@@ -452,10 +536,8 @@ def parse_srt(content):
 
 
 def gemini_batch(texts, api_key, target_lang='ru'):
-    parts = []
-    for i, t in enumerate(texts):
-        parts.append(f"<s id=\"{i}\"><en>{t}</en></s>")
-
+    """Translate a batch of subtitle lines via Gemini API."""
+    parts = [f'<s id="{i}"><en>{t}</en></s>' for i, t in enumerate(texts)]
     lang_name = 'Russian' if target_lang == 'ru' else 'Ukrainian'
     tag = target_lang
 
@@ -503,20 +585,15 @@ def gemini_batch(texts, api_key, target_lang='ru'):
         return texts
 
     reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
     result = {}
 
     regex_full = re.compile(
-        rf'<s\s+id=["\']?(\d+)["\']?>\s*<{tag}>(.*?)</{tag}>\s*</s>',
-        re.DOTALL
-    )
+        rf'<s\s+id=["\']?(\d+)["\']?>\s*<{tag}>(.*?)</{tag}>\s*</s>', re.DOTALL)
     for m in regex_full.finditer(reply):
         result[int(m.group(1))] = m.group(2).strip()
 
     regex_partial = re.compile(
-        rf'<s\s+id=["\']?(\d+)["\']?>\s*<{tag}>(.*?)(?:</{tag}>|$)',
-        re.DOTALL
-    )
+        rf'<s\s+id=["\']?(\d+)["\']?>\s*<{tag}>(.*?)(?:</{tag}>|$)', re.DOTALL)
     for m in regex_partial.finditer(reply):
         idx = int(m.group(1))
         if idx not in result:
@@ -531,198 +608,220 @@ def gemini_batch(texts, api_key, target_lang='ru'):
             if m:
                 result[int(m.group(1))] = m.group(2).strip()
 
+    # Retry missing lines one by one
+    missing = [i for i in range(len(texts)) if i not in result]
+    if missing:
+        add_log(f"  ⚠ {len(missing)} lines missing, retrying individually...", "warn")
+        for i in missing:
+            single = _translate_single(texts[i], api_key, target_lang)
+            result[i] = single
+
+    return [result.get(i, texts[i]) for i in range(len(texts))]
+
+
+def _translate_single(text, api_key, target_lang):
+    """Translate a single subtitle line, used as fallback for missed lines."""
+    global _last_api_call
+    lang_name = 'Russian' if target_lang == 'ru' else 'Ukrainian'
+    tag = target_lang
+
+    prompt = (
+        f"Translate this subtitle line from English to {lang_name}. "
+        f"Reply with only the translation, no explanations.\n\n{text}"
+    )
+
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 256}
+    }).encode()
+
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={api_key}")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+
+    for attempt in range(3):
+        try:
+            elapsed = time.time() - _last_api_call
+            if elapsed < MIN_API_INTERVAL:
+                time.sleep(MIN_API_INTERVAL - elapsed)
+            _last_api_call = time.time()
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as e:
+            time.sleep((attempt + 1) * 5)
+
+    return text  # fallback to original if all retries fail
+
+    if not result:
+        for line in reply.split("\n"):
+            m = re.match(r"\[(\d+)\]\s*(.*)", line.strip())
+            if m:
+                result[int(m.group(1))] = m.group(2).strip()
+
     missing = [i for i in range(len(texts)) if i not in result]
     if missing:
         add_log(f"  ⚠ {len(missing)}/{len(texts)} lines not parsed (ids: {missing[:5]}{'...' if len(missing)>5 else ''})", "warn")
         add_log(f"  ⚠ Raw reply preview: {reply[:200].strip()}", "warn")
 
     return [result.get(i, texts[i]) for i in range(len(texts))]
-  """Translate a batch of lines in one structured request to the given language.
-  target_lang: 'ru' or 'uk'"""
-  parts = []
-  for i, t in enumerate(texts):
-    parts.append(f"<s id=\"{i}\"><en>{t}</en></s>")
 
-  lang_name = 'Russian' if target_lang == 'ru' else 'Ukrainian'
-  tag = target_lang
 
-  prompt = (
-    f"Translate TV show subtitles from English to {lang_name}. "
-    f"For each <s> tag return <s id=\"N\"><{tag}>TRANSLATION</{tag}></s>. "
-    "Translate ALL content fully, do not shorten. "
-    "Respond only with XML, without explanations.\n\n" + "\n".join(parts)
-  )
-
-  body = json.dumps({
-    "contents": [{"parts": [{"text": prompt}]}],
-    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192}
-  }).encode()
-
-  url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-       f"{GEMINI_MODEL}:generateContent?key={api_key}")
-  req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-
-  data = None
-  global _last_api_call
-  for attempt in range(4):
-    try:
-      # Enforce minimum interval between API calls to respect RPM limit
-      elapsed = time.time() - _last_api_call
-      if elapsed < MIN_API_INTERVAL:
-        to_wait = MIN_API_INTERVAL - elapsed
-        add_log(f"  ⏳ Throttling: sleeping {to_wait:.1f}s to respect {API_RPM_LIMIT} RPM", "warn")
-        time.sleep(to_wait)
-      _last_api_call = time.time()
-      with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read())
-      break
-    except Exception as e:
-      err_str = str(e)
-      if "429" in err_str or "quota" in err_str.lower():
-        wait = (attempt + 1) * 20
-        add_log(f"  ⏳ Rate limit (attempt {attempt+1}/4), waiting {wait}s...", "warn")
-      else:
-        wait = (attempt + 1) * 5
-        add_log(f"  ⚠ API error (attempt {attempt+1}/4): {err_str[:120]}, retry in {wait}s...", "warn")
-      time.sleep(wait)
-
-  if data is None:
-    add_log(f"  ❌ All retries failed, using original for this batch", "err")
-    return texts
-
-  reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-  # Parse XML response using chosen tag (tolerant to spaces/newlines around tags)
-  result = {}
-  regex = re.compile(rf'<s\s+id=["\']?(\d+)["\']?>\s*<{tag}>(.*?)</{tag}>\s*</s>', re.DOTALL)
-  for m in regex.finditer(reply):
-    result[int(m.group(1))] = m.group(2).strip()
-
-  # If XML not recognized — try numeric [N] fallback
-  if not result:
-    for line in reply.split("\n"):
-      m = re.match(r"\[(\d+)\]\s*(.*)", line.strip())
-      if m:
-        result[int(m.group(1))] = m.group(2).strip()
-
-  # Log missing translations so we can see what went wrong
-  missing = [i for i in range(len(texts)) if i not in result]
-  if missing:
-    add_log(f"  ⚠ {len(missing)}/{len(texts)} lines not parsed in batch (ids: {missing[:5]}{'...' if len(missing)>5 else ''})", "warn")
-    add_log(f"  ⚠ Raw reply preview: {reply[:200].strip()}", "warn")
-
-  return [result.get(i, texts[i]) for i in range(len(texts))]
-
-def run_translation(video_url, api_key, track, force=False, lang='ru'):
-  global _running, _progress
-  try:
-    video_url = normalize_url(video_url)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    parsed = urllib.parse.urlparse(video_url)
-    basename = os.path.splitext(os.path.basename(parsed.path))[0].strip("\\/") or "subtitles"
-    raw_srt = os.path.join(OUTPUT_DIR, f"{basename}.en.srt")
-    translated_srt = os.path.join(OUTPUT_DIR, f"{basename}.{lang}.srt")
-
-    add_log(f"🎬 {basename}", "accent")
-    add_log(f"🔗 {video_url}", "")
-
-    # Step 1: extraction
-    if os.path.exists(raw_srt) and os.path.getsize(raw_srt) > 0:
-      add_log("✓ Using cached subtitles", "ok")
-      set_status("Subtitles from cache", 25)
-    else:
-      add_log("⏳ Extracting subtitles (1–5 min)...", "")
-      set_status("Extracting subtitles...", 5)
-      cmd = ["ffmpeg", "-y", "-analyzeduration", "10M", "-probesize", "10M",
-           "-i", video_url, "-map", f"0:s:{track}",
-           "-vn", "-an", "-c:s", "srt", raw_srt]
-      try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-      except subprocess.TimeoutExpired:
-        add_log("❌ ffmpeg timeout", "err")
-        return
-      if not os.path.exists(raw_srt) or os.path.getsize(raw_srt) == 0:
-        for line in result.stderr.strip().split("\n")[-5:]:
-          if line.strip():
-            add_log(f"  {line.strip()}", "err")
-        add_log("❌ Failed to extract subtitles", "err")
-        set_status("Extraction error")
-        return
-      add_log(f"✓ Extracted {os.path.getsize(raw_srt)} bytes", "ok")
-      set_status("Subtitles extracted", 25)
-
-    if not _running:
-      return
-
-    # Step 2: translation — check cache
-    if not force and os.path.exists(translated_srt) and os.path.getsize(translated_srt) > 0:
-      add_log("✓ Using existing translation", "ok")
-      set_status("Using translation cache", 95)
-    else:
-      lang_name = 'Russian' if lang == 'ru' else 'Ukrainian'
-      add_log(f"🌐 Translating EN → {lang_name} via Gemini...", "")
-
-    with open(raw_srt, encoding="utf-8", errors="replace") as f:
-      content = f.read()
-    blocks = parse_srt(content)
+def _translate_blocks(blocks, api_key, lang):
+    """Shared translation loop used by both run_translation and run_translation_text."""
+    global _running
     total = len(blocks)
-    if total == 0:
-      add_log("❌ Subtitles are empty", "err")
-      return
-    add_log(f"  Blocks: {total}", "")
     translated_texts = []
-
     i = 0
     while i < total:
-      if not _running:
-        return
-      # Build a batch that fits within estimated input token budget
-      batch = []
-      batch_input_tokens = 0
-      j = i
-      while j < total and len(batch) < MAX_BATCH_SIZE_LIMIT:
-        t = blocks[j][2]
-        tok = estimate_tokens(t)
-        if batch_input_tokens + tok > MAX_INPUT_TOKENS_PER_REQUEST:
-          break
-        batch.append(blocks[j])
-        batch_input_tokens += tok
-        j += 1
+        if not _running:
+            return None
+        batch, batch_input_tokens, j = [], 0, i
+        while j < total and len(batch) < MAX_BATCH_SIZE_LIMIT:
+            tok = estimate_tokens(blocks[j][2])
+            if batch_input_tokens + tok > MAX_INPUT_TOKENS_PER_REQUEST:
+                break
+            batch.append(blocks[j])
+            batch_input_tokens += tok
+            j += 1
+        if not batch:
+            batch, j = [blocks[i]], i + 1
 
-      # If nothing was added (single line exceeds limit), force at least one
-      if not batch:
-        batch = [blocks[i]]
-        j = i + 1
+        texts = [b[2] for b in batch]
+        try:
+            translated_texts.extend(gemini_batch(texts, api_key, lang))
+        except Exception as e:
+            add_log(f"  ⚠ Batch at {i}: {e}", "warn")
+            translated_texts.extend(texts)
+            time.sleep(2)
 
-      texts = [b[2] for b in batch]
-      try:
-        translated_texts.extend(gemini_batch(texts, api_key, lang))
-      except Exception as e:
-        add_log(f"  ⚠ Batch at {i}: {e}", "warn")
-        translated_texts.extend(texts)
-        time.sleep(2)
+        done = min(j, total)
+        set_status(f"Translating: {done}/{total}", 25 + int(done / total * 70))
+        time.sleep(0.05)
+        i = j
+    return translated_texts
 
-      done = min(j, total)
-      set_status(f"Translating: {done}/{total}", 25 + int(done / total * 70))
-      # Small pause to allow UI updates; API throttling enforced in gemini_batch
-      time.sleep(0.05)
-      i = j
 
-    with open(translated_srt, "w", encoding="utf-8") as f:
-      for i, (idx, timing, _) in enumerate(blocks):
-        text = translated_texts[i].strip() if i < len(translated_texts) else ""
-        f.write(f"{idx}\n{timing}\n{text}\n\n")
+def run_translation(video_url, api_key, track, force=False, lang='ru'):
+    """Translate subtitles extracted from a TorrServer video URL."""
+    global _running, _progress
+    try:
+        video_url = normalize_url(video_url)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        parsed = urllib.parse.urlparse(video_url)
+        basename = os.path.splitext(os.path.basename(parsed.path))[0].strip("\\/") or "subtitles"
+        raw_srt = os.path.join(OUTPUT_DIR, f"{basename}.en.srt")
+        translated_srt = os.path.join(OUTPUT_DIR, f"{basename}.{lang}.srt")
 
-    # Finished
-    add_log("✅ Done!", "ok")
-    set_status("Done", 100)
-    add_log(f"Saved: {translated_srt}", "")
+        add_log(f"🎬 {basename}", "accent")
+        add_log(f"🔗 {video_url}", "")
 
-  except Exception as e:
-    add_log(f"❌ {e}", "err")
-    set_status("Error")
-  finally:
-    _running = False
+        # Step 1: extraction
+        if os.path.exists(raw_srt) and os.path.getsize(raw_srt) > 0:
+            add_log("✓ Using cached subtitles", "ok")
+            set_status("Subtitles from cache", 25)
+        else:
+            add_log("⏳ Extracting subtitles (1–5 min)...", "")
+            set_status("Extracting subtitles...", 5)
+            cmd = ["ffmpeg", "-y", "-analyzeduration", "10M", "-probesize", "10M",
+                   "-i", video_url, "-map", f"0:s:{track}",
+                   "-vn", "-an", "-c:s", "srt", raw_srt]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            except subprocess.TimeoutExpired:
+                add_log("❌ ffmpeg timeout", "err")
+                return
+            if not os.path.exists(raw_srt) or os.path.getsize(raw_srt) == 0:
+                for line in result.stderr.strip().split("\n")[-5:]:
+                    if line.strip():
+                        add_log(f"  {line.strip()}", "err")
+                add_log("❌ Failed to extract subtitles", "err")
+                set_status("Extraction error")
+                return
+            add_log(f"✓ Extracted {os.path.getsize(raw_srt)} bytes", "ok")
+            set_status("Subtitles extracted", 25)
+
+        if not _running:
+            return
+
+        # Step 2: translation
+        if not force and os.path.exists(translated_srt) and os.path.getsize(translated_srt) > 0:
+            add_log("✓ Using existing translation", "ok")
+            set_status("Done", 100)
+            add_log(f"Saved: {translated_srt}", "")
+            add_log("✅ Done!", "ok")
+            return
+
+        lang_name = 'Russian' if lang == 'ru' else 'Ukrainian'
+        add_log(f"🌐 Translating EN → {lang_name} via Gemini...", "")
+
+        with open(raw_srt, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        blocks = parse_srt(content)
+        total = len(blocks)
+        if total == 0:
+            add_log("❌ Subtitles are empty", "err")
+            return
+        add_log(f"  Blocks: {total}", "")
+
+        translated_texts = _translate_blocks(blocks, api_key, lang)
+        if translated_texts is None:
+            return
+
+        with open(translated_srt, "w", encoding="utf-8") as f:
+            for i, (idx, timing, _) in enumerate(blocks):
+                text = translated_texts[i].strip() if i < len(translated_texts) else ""
+                f.write(f"{idx}\n{timing}\n{text}\n\n")
+
+        add_log("✅ Done!", "ok")
+        set_status("Done", 100)
+        add_log(f"Saved: {translated_srt}", "")
+
+    except Exception as e:
+        add_log(f"❌ {e}", "err")
+        set_status("Error")
+    finally:
+        _running = False
+
+
+def run_translation_text(content, filename, api_key, lang='ru'):
+    """Translate subtitles from an already-loaded SRT/VTT string."""
+    global _running, _progress
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        basename = os.path.splitext(filename)[0] or "subtitles"
+        translated_srt = os.path.join(OUTPUT_DIR, f"{basename}.{lang}.srt")
+
+        add_log(f"📄 {filename}", "accent")
+
+        blocks = parse_srt(content)
+        total = len(blocks)
+        if total == 0:
+            add_log("❌ No subtitle blocks found", "err")
+            return
+        add_log(f"  Blocks: {total}", "")
+
+        lang_name = 'Russian' if lang == 'ru' else 'Ukrainian'
+        add_log(f"🌐 Translating EN → {lang_name} via Gemini...", "")
+
+        translated_texts = _translate_blocks(blocks, api_key, lang)
+        if translated_texts is None:
+            return
+
+        with open(translated_srt, "w", encoding="utf-8") as f:
+            for i, (idx, timing, _) in enumerate(blocks):
+                text = translated_texts[i].strip() if i < len(translated_texts) else ""
+                f.write(f"{idx}\n{timing}\n{text}\n\n")
+
+        add_log("✅ Done!", "ok")
+        set_status("Done", 100)
+        add_log(f"Saved: {translated_srt}", "")
+
+    except Exception as e:
+        add_log(f"❌ {e}", "err")
+        set_status("Error")
+    finally:
+        _running = False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -748,15 +847,15 @@ class Handler(BaseHTTPRequestHandler):
                         "running": _running, "log": list(_log_lines)}
             self._send(200, "application/json", json.dumps(data))
         elif self.path.startswith("/check"):
-          params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-          url = params.get("url", [""])[0]
-          lang = params.get("lang", ["ru"])[0]
-          url = normalize_url(url)
-          parsed = urllib.parse.urlparse(url)
-          basename = os.path.splitext(os.path.basename(parsed.path))[0].strip("\/") or "subtitles"
-          translated_srt = os.path.join(OUTPUT_DIR, f"{basename}.{lang}.srt")
-          exists = os.path.exists(translated_srt) and os.path.getsize(translated_srt) > 0
-          self._send(200, "application/json", json.dumps({"exists": exists, "path": translated_srt, "lang": lang}))
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            url = params.get("url", [""])[0]
+            lang = params.get("lang", ["ru"])[0]
+            url = normalize_url(url)
+            parsed = urllib.parse.urlparse(url)
+            basename = os.path.splitext(os.path.basename(parsed.path))[0].strip("\\/") or "subtitles"
+            translated_srt = os.path.join(OUTPUT_DIR, f"{basename}.{lang}.srt")
+            exists = os.path.exists(translated_srt) and os.path.getsize(translated_srt) > 0
+            self._send(200, "application/json", json.dumps({"exists": exists, "path": translated_srt, "lang": lang}))
         elif self.path.startswith("/files"):
             try:
                 files = []
@@ -826,9 +925,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", '{"ok":true}')
 
         elif self.path == "/stop":
-          _running = False
-          _status = "Stopped"
-          self._send(200, "application/json", '{"ok":true}')
+            _running = False
+            _status = "Stopped"
+            self._send(200, "application/json", '{"ok":true}')
         else:
             self._send(400, "text/plain", "Bad request")
 
