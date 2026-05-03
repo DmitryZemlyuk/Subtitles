@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<title>Subtitles</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: transparent;
+    width: 1920px;
+    height: 1080px;
+    overflow: hidden;
+    font-family: 'Arial', sans-serif;
+  }
+
+  #subtitle {
+    position: absolute;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 85%;
+    text-align: center;
+    font-size: 32px;
+    font-weight: 700;
+    color: #ffffff;
+    text-shadow:
+      -2px -2px 0 #000,
+       2px -2px 0 #000,
+      -2px  2px 0 #000,
+       2px  2px 0 #000,
+       0    0   8px rgba(0,0,0,0.8);
+    line-height: 1.3;
+    letter-spacing: 0.01em;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+
+  #subtitle.visible {
+    opacity: 1;
+  }
+
+  /* Control panel — only visible when not in OBS (has background) */
+  #controls {
+    position: absolute;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    background: rgba(0,0,0,0.75);
+    padding: 12px 20px;
+    border-radius: 12px;
+    z-index: 100;
+  }
+
+  #controls button {
+    padding: 8px 20px;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  #btn-start {
+    background: #22c55e;
+    color: white;
+  }
+  #btn-start:hover { background: #16a34a; }
+
+  #btn-reset {
+    background: #ef4444;
+    color: white;
+  }
+  #btn-reset:hover { background: #dc2626; }
+
+  #btn-load {
+    background: #6d67f0;
+    color: white;
+  }
+  #btn-load:hover { background: #5550d0; }
+
+  #timer {
+    color: #e2e0f0;
+    font-size: 13px;
+    font-family: monospace;
+    min-width: 70px;
+    text-align: center;
+  }
+
+  #offset-controls {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  #offset-controls button {
+    padding: 6px 10px;
+    font-size: 12px;
+    background: #374151;
+    color: #e2e0f0;
+    border-radius: 6px;
+  }
+  #offset-controls button:hover { background: #4b5563; }
+
+  #offset-label {
+    color: #9ca3af;
+    font-size: 12px;
+    font-family: monospace;
+    min-width: 60px;
+    text-align: center;
+  }
+
+  #status {
+    color: #9ca3af;
+    font-size: 12px;
+  }
+
+  /* Hide controls in OBS (body has transparent bg, no pointer events on body) */
+  body.obs-mode #controls {
+    display: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="controls">
+  <button id="btn-load" onclick="loadFile()">📂 Load SRT</button>
+  <button id="btn-start" onclick="startStop()">▶ Start</button>
+  <button id="btn-reset" onclick="reset()">↺ Reset</button>
+  <div id="timer">0:00.0</div>
+  <div id="offset-controls">
+    <button onclick="adjustOffset(-500)">−0.5s</button>
+    <button onclick="adjustOffset(-100)">−0.1s</button>
+    <div id="offset-label">±0.0s</div>
+    <button onclick="adjustOffset(+100)">+0.1s</button>
+    <button onclick="adjustOffset(+500)">+0.5s</button>
+  </div>
+  <div id="status">No SRT loaded</div>
+</div>
+
+<div id="subtitle"></div>
+
+<input type="file" id="file-input" accept=".srt" style="display:none" onchange="onFileSelected(event)">
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let blocks = [];       // [{start, end, text}]
+let startTime = null;  // performance.now() when started
+let running = false;
+let offsetMs = 0;      // manual sync offset in ms
+let rafId = null;
+let currentIdx = -1;
+
+// ── SRT Parser ─────────────────────────────────────────────────────────────
+function parseTime(ts) {
+  const [hm, s, ms] = [ts.slice(0,5), ts.slice(6,8), ts.slice(9,12)];
+  const [h, m] = hm.split(':').map(Number);
+  return h * 3600000 + m * 60000 + parseInt(s) * 1000 + parseInt(ms);
+}
+
+function parseSRT(text) {
+  const result = [];
+  const re = /\d+\s*\n(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})\s*\n([\s\S]*?)(?=\n\s*\n\d+\s*\n|\n\s*\n?$)/g;
+  let m;
+  while ((m = re.exec(text + '\n\n')) !== null) {
+    const txt = m[3].replace(/<[^>]+>|\{[^}]+\}/g, '').trim();
+    if (txt) result.push({ start: parseTime(m[1]), end: parseTime(m[2]), text: txt });
+  }
+  return result;
+}
+
+// ── File loading ───────────────────────────────────────────────────────────
+function loadFile() {
+  document.getElementById('file-input').click();
+}
+
+function onFileSelected(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    blocks = parseSRT(ev.target.result);
+    document.getElementById('status').textContent = `✓ ${blocks.length} blocks: ${file.name}`;
+    reset();
+  };
+  reader.readAsText(file, 'utf-8');
+}
+
+// ── Playback ───────────────────────────────────────────────────────────────
+function startStop() {
+  if (!blocks.length) { alert('Load an SRT file first'); return; }
+  if (running) {
+    pause();
+  } else {
+    start();
+  }
+}
+
+function start() {
+  if (startTime === null) {
+    startTime = performance.now();
+  } else {
+    // Resume: adjust startTime so elapsed time continues correctly
+    startTime = performance.now() - _pausedAt;
+  }
+  running = true;
+  document.getElementById('btn-start').textContent = '⏸ Pause';
+  tick();
+}
+
+let _pausedAt = 0;
+function pause() {
+  _pausedAt = performance.now() - startTime;
+  running = false;
+  document.getElementById('btn-start').textContent = '▶ Resume';
+  if (rafId) cancelAnimationFrame(rafId);
+}
+
+function reset() {
+  running = false;
+  startTime = null;
+  _pausedAt = 0;
+  currentIdx = -1;
+  if (rafId) cancelAnimationFrame(rafId);
+  document.getElementById('btn-start').textContent = '▶ Start';
+  document.getElementById('timer').textContent = '0:00.0';
+  setSubtitle('', false);
+}
+
+function adjustOffset(ms) {
+  offsetMs += ms;
+  document.getElementById('offset-label').textContent =
+    (offsetMs >= 0 ? '+' : '') + (offsetMs / 1000).toFixed(1) + 's';
+}
+
+// ── Render loop ────────────────────────────────────────────────────────────
+function tick() {
+  if (!running) return;
+
+  const elapsed = performance.now() - startTime + offsetMs;
+
+  // Update timer display
+  const s = elapsed / 1000;
+  const mm = Math.floor(s / 60);
+  const ss = (s % 60).toFixed(1).padStart(4, '0');
+  document.getElementById('timer').textContent = `${mm}:${ss}`;
+
+  // Find active block
+  let active = null;
+  for (let i = 0; i < blocks.length; i++) {
+    if (elapsed >= blocks[i].start && elapsed < blocks[i].end) {
+      active = blocks[i];
+      break;
+    }
+  }
+
+  if (active) {
+    setSubtitle(active.text, true);
+  } else {
+    setSubtitle('', false);
+  }
+
+  rafId = requestAnimationFrame(tick);
+}
+
+function setSubtitle(text, visible) {
+  const el = document.getElementById('subtitle');
+  if (visible && text) {
+    el.innerHTML = text.replace(/\n/g, '<br>');
+    el.classList.add('visible');
+  } else {
+    el.classList.remove('visible');
+  }
+}
+
+// ── OBS external trigger ───────────────────────────────────────────────────
+// Called by obs_sync_start.py via Browser Source execute_script
+window.obsStart = function() {
+  if (blocks.length && !running) {
+    reset();
+    start();
+  }
+};
+
+// ── Keyboard shortcuts ─────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); startStop(); }
+  if (e.code === 'KeyR')  { reset(); }
+  if (e.code === 'ArrowLeft')  adjustOffset(-500);
+  if (e.code === 'ArrowRight') adjustOffset(+500);
+});
+</script>
+</body>
+</html>
