@@ -1,17 +1,21 @@
 # SubTranslate
 
-Web UI utility to extract and translate subtitles from TorrServer streams using Gemini.
+Small toolkit and web UI to extract, translate and convert subtitles for video streams.
 
-This repository contains a small HTTP server (`translate_subs.py`) that extracts subtitle tracks via `ffmpeg`, sends batches to Gemini for translation, and saves translated .srt files. The app no longer attempts to open video players — it only translates and writes subtitle files.
+This repository includes a lightweight HTTP server (`translate_subs.py`) that extracts subtitle tracks via `ffmpeg`, translates them using the Generative Language API (Gemini), and saves translated .srt files. It also contains helper scripts to convert subtitle files to audio (`srt_to_mp3_elevenlabs.py`) and to assist with simple OBS synchronization workflows (`obs_sync_start.py`).
 
 ## Features
-- Extract subtitle track from a video stream (via `ffmpeg`).
-- Translate subtitles from English to Ukrainian (`uk`) or Russian (`ru`) with Gemini.
-- Web UI for entering video URL, Gemini API key, subtitle track and target language.
-- Outputs saved to `~/Downloads/translated_subs` by default (or a mounted directory in Docker).
+- Extract subtitle tracks from a video stream (via `ffmpeg`).
+- Translate subtitles using Gemini (Generative Language API).
+- Convert `.srt` files to spoken audio via ElevenLabs (`srt_to_mp3_elevenlabs.py`).
+- Small helper for starting OBS-sync workflows (`obs_sync_start.py`).
+- Web UI for entering stream URL, API key, subtitle track and target language.
+- Default outputs saved to `~/Downloads/translated_subs` (or a host-mounted directory in Docker).
 
 ## Files
-- `translate_subs.py` — main server script.
+- `translate_subs.py` — main server (HTTP UI + translation worker).
+- `srt_to_mp3_elevenlabs.py` — convert `.srt` to spoken `mp3` using ElevenLabs voices.
+- `obs_sync_start.py` — small helper script for OBS/startup sync scenarios.
 - `Dockerfile` — container image with Python + ffmpeg.
 - `docker-compose.yml` — convenient compose setup for running the service.
 
@@ -64,7 +68,7 @@ If you prefer not to set `GEMINI_API_KEY` as an env var, enter it in the web UI 
 - TorrServer video URL — URL of the stream to extract subtitles from.
 - Gemini API Key — your API key for the Generative Language API.
 - Subtitle track — integer track index (default `0`).
-- Target language — choose `Ukrainian (uk)`or `Russian (ru)`.
+- Target language — choose `Ukrainian (uk)`, `Russian (ru)`, or other supported language codes depending on your Gemini model.
 
 Example TorrServer URL:
 
@@ -82,17 +86,19 @@ The web UI looks like this (place your screenshot at `assets/screenshot.png`):
 ## Output
 Files are written as `<basename>.<lang>.srt`, e.g. `movie.ru.srt` or `movie.uk.srt` in the output directory.
 
+The `srt_to_mp3_elevenlabs.py` script writes `<basename>.<lang>.mp3` files next to your `.srt` files when converting subtitles to audio.
+
 ## Advanced
 - The server exposes `/state` (JSON) with status, progress and log lines and `/files` to list output files for diagnostics.
-- If running in Docker, the server binds to `0.0.0.0:7755` and you access it from the host at `http://localhost:7755`.
+- If running in Docker, the service binds to `0.0.0.0:7755`; access the UI at `http://localhost:7755` from your host.
 
 ## Troubleshooting
 - If subtitles extraction fails, ensure `ffmpeg` can access the stream and the correct subtitle track is selected.
-- For Gemini rate limits, the script does basic retry/backoff and will log rate-limit warnings in the UI.
- - For Gemini rate limits, the script does basic retry/backoff and will log rate-limit warnings in the UI. See: https://aistudio.google.com/rate-limit
- - To create or manage Gemini API keys visit: https://aistudio.google.com/app/api-keys
+- For Gemini rate limits, the script implements simple retry/backoff and surfaces warnings in the UI.
+- To manage Gemini API keys or view quota information, use the Google Cloud / AI Studio console for your account.
+
 ## Security
-- Keep your `GEMINI_API_KEY` secret. Prefer passing it via environment variables or a host-mounted `~/.subtranslate.json` instead of embedding in images.
+- Keep your `GEMINI_API_KEY` secret. Pass it via environment variables or a host-mounted `~/.subtranslate.json` rather than embedding it into images or committed files.
 
 ## License
-Use as you wish. No license file provided.
+This repository does not include a formal license file. Treat the code as provided "as-is" for personal or internal use. Add a license if you plan to redistribute or publish the project.
