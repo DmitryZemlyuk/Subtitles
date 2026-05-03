@@ -787,9 +787,41 @@ class Handler(BaseHTTPRequestHandler):
             _status = "Starting..."
             _running = True
             threading.Thread(
-              target=run_translation,
-              args=(data["url"], data["key"], data.get("track", "0"), data.get("force", False), data.get("lang", "ru")),
-              daemon=True
+                target=run_translation,
+                args=(data["url"], data["key"], data.get("track", "0"),
+                      data.get("force", False), data.get("lang", "ru")),
+                daemon=True
+            ).start()
+            self._send(200, "application/json", '{"ok":true}')
+
+        elif self.path == "/start_file" and not _running:
+            import cgi
+            ctype, pdict = cgi.parse_header(self.headers.get('Content-Type', ''))
+            pdict['boundary'] = pdict.get('boundary', '').encode()
+            import io
+            fields = cgi.parse_multipart(io.BytesIO(body), pdict)
+
+            content  = fields.get('content',  [b''])[0]
+            filename = fields.get('filename', [b'subtitles.srt'])[0]
+            api_key  = fields.get('key',      [b''])[0]
+            lang     = fields.get('lang',     [b'ru'])[0]
+
+            # Decode bytes if needed
+            if isinstance(content,  bytes): content  = content.decode('utf-8', errors='replace')
+            if isinstance(filename, bytes): filename = filename.decode('utf-8', errors='replace')
+            if isinstance(api_key,  bytes): api_key  = api_key.decode('utf-8', errors='replace')
+            if isinstance(lang,     bytes): lang     = lang.decode('utf-8', errors='replace')
+
+            save_settings(api_key, "0", lang)
+            with _lock:
+                _log_lines = []
+                _progress = 0
+            _status = "Starting..."
+            _running = True
+            threading.Thread(
+                target=run_translation_text,
+                args=(content, filename, api_key, lang),
+                daemon=True
             ).start()
             self._send(200, "application/json", '{"ok":true}')
 
